@@ -1,0 +1,9 @@
+pip-system-certs
+requests
+crewai
+crewai-tools
+fastmcp
+mcp
+google-generativeai
+pyyaml
+python-dotenv
