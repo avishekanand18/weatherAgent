@@ -7,3 +7,5 @@ mcp
 google-generativeai
 pyyaml
 python-dotenv
+tenacity
+pydantic

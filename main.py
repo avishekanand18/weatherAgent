@@ -1,5 +1,8 @@
 import sys
+import traceback
+
 from src.agent import run_agri_crew
+from src.prompts import RiskReport
 
 def print_header():
     print("="*60)
@@ -36,13 +39,32 @@ def main():
             print("\n" + "="*60)
             print(" 📋 FINAL AGRONOMIC REPORT ")
             print("="*60)
-            print(result)
+            _render_result(result)
             print("="*60)
             print("📂 Note: A detailed trace of this session has been saved in the 'logs/' folder.")
 
+        except KeyboardInterrupt:
+            print("\nInterrupted by user. Goodbye! 👋")
+            sys.exit(0)
         except Exception as e:
-            print(f"\n❌ An error occurred during execution: {e}")
+            print(f"\n❌ {type(e).__name__} during execution: {e}")
             print("Check your API keys, internet connection, or quota limits.")
+            traceback.print_exc()
+
+
+def _render_result(result):
+    """Pretty-print a CrewAI result that may carry a Pydantic RiskReport."""
+    report = getattr(result, "pydantic", None)
+    if isinstance(report, RiskReport):
+        print(f"Severity      : {report.severity.upper()}")
+        print(f"Primary Risk  : {report.primary_risk}")
+        if report.affected_dates:
+            print(f"Affected Dates: {', '.join(report.affected_dates)}")
+        print(f"Recommendation: {report.recommendation}")
+        print("-" * 60)
+        print(report.summary)
+    else:
+        print(result)
 
 if __name__ == "__main__":
     # Ensure the script runs only when executed directly

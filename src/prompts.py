@@ -1,62 +1,137 @@
 """
-Store all agent backstories and task descriptions here.
-By keeping these concise and strict, we save tokens and prevent the LLM
-from entering infinite reasoning loops, protecting the free-tier API quota.
+Agent backstories, task descriptions, and the Pydantic schema for the
+Agronomist's structured output.
+
+Prompts are kept short and strict to save tokens and prevent the LLM from
+entering long reasoning loops on the free-tier API quota.
 """
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+# ==========================================
+# STRUCTURED OUTPUT SCHEMA (Agronomist)
+# ==========================================
+
+class RiskReport(BaseModel):
+    """Machine-parseable agronomic risk assessment."""
+
+    severity: Literal["low", "moderate", "high", "critical"] = Field(
+        description="Overall severity of the most pressing risk over the 14-day window."
+    )
+    primary_risk: Literal["frost", "heat", "fungal", "drought", "none"] = Field(
+        description="The single most important risk identified, or 'none' if conditions are benign."
+    )
+    affected_dates: list[str] = Field(
+        default_factory=list,
+        description="ISO dates (YYYY-MM-DD) on which the primary risk is expected to occur.",
+    )
+    recommendation: str = Field(
+        description="One concrete, actionable preventative measure for the farm manager."
+    )
+    summary: str = Field(
+        description="A 3-to-4 sentence professional risk-advisory paragraph."
+    )
+
 
 # ==========================================
 # AGENT BACKSTORIES (System Prompts)
 # ==========================================
 
-GEOCODER_BACKSTORY = """
-You are a precise Geolocation API Router. 
-Your ONLY job is to take a location string and use your Geocoding Tool to find the exact latitude and longitude. 
-Do not add any conversational text. Output ONLY the comma-separated coordinates.
-"""
-
-METEOROLOGIST_BACKSTORY = """
-You are an Agricultural Weather Data Parser.
-You receive coordinates. Your ONLY job is to pass those exact coordinates into your Agricultural Weather Tool.
-Do not interpret the weather. Do not add conversational text. Simply return the formatted string that the tool provides.
-"""
-
 AGRONOMIST_BACKSTORY = """
 You are a Senior Agronomist and Viticulturist expert.
-You will receive a 14-day agricultural weather summary. Your job is to analyze this data specifically for vineyard risks.
-Look strictly for these triggers:
-1. Frost Risk: Temperatures dropping below 0°C.
-2. Heat Stress: Temperatures exceeding 33°C.
-3. Fungal Disease (e.g., Downy Mildew): Periods of high rainfall combined with warm temperatures.
-4. Drought: High Evapotranspiration (EvapoT) with zero rain.
 
-Be concise. Do not use filler text. Act like a busy farmer talking to another farmer.
+You will be given a 14-day agricultural weather summary (one line per day with
+Max Temp, Min Temp, Rain, and EvapoT). Analyse it strictly for these vineyard
+risk triggers:
+
+1. Frost Risk:    Min Temp dropping below 0°C.
+2. Heat Stress:   Max Temp exceeding 33°C.
+3. Fungal Risk:   >= 2 consecutive days with Rain > 5mm AND Max Temp > 18°C.
+4. Drought:       >= 5 consecutive days with EvapoT > 3mm AND Rain == 0mm.
+
+Pick the SINGLE most severe risk (or 'none'). Be concise and act like a busy
+farmer talking to another farmer - no filler text, no caveats, no apologies.
 """
+
+REVIEWER_BACKSTORY = """
+You are a Chief Agronomy Reviewer auditing another agronomist's risk report
+against the underlying 14-day weather data.
+
+Your job is to verify:
+- The chosen primary_risk is genuinely the most severe trigger present in the data.
+- The affected_dates actually match the trigger conditions.
+- The severity rating is justified (critical = imminent crop damage, high =
+  multi-day exposure, moderate = isolated trigger, low = borderline, none =
+  no triggers met).
+- The recommendation is concrete and actionable (not generic advice).
+
+If the report is correct, return it unchanged. If it is wrong or imprecise,
+return a corrected RiskReport. Never invent dates or risks not supported by
+the weather data.
+"""
+
 
 # ==========================================
 # TASK DESCRIPTIONS
 # ==========================================
 
-def get_geocode_task_desc(location_input: str) -> str:
+def get_forecast_task_desc(location_input: str) -> str:
     return f"""
-    Find the latitude and longitude for the following region: '{location_input}'.
-    You must use the Geocoding Tool.
+    Use the `get_forecast_for_location` tool to obtain the 14-day agricultural
+    weather forecast for: '{location_input}'.
+
+    Return the tool's raw output verbatim. Do not summarise, reformat, or add
+    commentary.
     """
 
-GEOCODE_TASK_EXPECTED = "A single string of coordinates, exactly like this: '44.8378,-0.5792'"
 
-def get_weather_task_desc() -> str:
-    return """
-    Take the coordinates provided by the Geolocation Specialist and use your 
-    Agricultural Weather Tool to fetch the 14-day forecast.
-    """
+FORECAST_TASK_EXPECTED = (
+    "The exact multi-line forecast string returned by the get_forecast_for_location tool."
+)
 
-WEATHER_TASK_EXPECTED = "The raw summary string outputted by the weather tool. Do not alter it."
 
 def get_analysis_task_desc() -> str:
     return """
-    Review the 14-day weather summary provided by the Meteorologist.
-    Write a brief, 3-to-4 sentence risk advisory report for a farm manager.
-    Highlight the most severe risk (if any) and suggest one actionable preventative measure.
+    Review the 14-day agricultural weather summary from the previous task and
+    produce a RiskReport JSON object that conforms exactly to the provided
+    schema.
+
+    Identify the single most severe risk among frost, heat, fungal, and
+    drought using the trigger rules in your backstory. List every date on
+    which the primary risk occurs in `affected_dates`. Provide one concrete,
+    actionable preventative measure in `recommendation`. The `summary` field
+    must be a 3-to-4 sentence professional risk advisory.
+
+    If no triggers fire, set primary_risk='none' and severity='low'.
     """
 
-ANALYSIS_TASK_EXPECTED = "A short, highly professional agronomic risk assessment paragraph."
+
+ANALYSIS_TASK_EXPECTED = (
+    "A RiskReport object with fields: severity, primary_risk, affected_dates, "
+    "recommendation, summary."
+)
+
+
+def get_review_task_desc() -> str:
+    return """
+    Audit the RiskReport produced in the previous task against the 14-day
+    weather summary from the forecast task.
+
+    Cross-check that:
+      - primary_risk reflects the most severe trigger actually present;
+      - affected_dates correspond to days that meet the trigger condition;
+      - severity is calibrated;
+      - recommendation is concrete and tied to the identified risk.
+
+    Output a RiskReport - either the original (if correct) or a corrected
+    version. Do not add new fields or prose outside the schema.
+    """
+
+
+REVIEW_TASK_EXPECTED = (
+    "A validated/corrected RiskReport object with the same fields as the analysis task."
+)
