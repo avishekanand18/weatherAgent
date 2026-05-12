@@ -4,6 +4,14 @@ A multi-agent CLI assistant that turns a plain-English location ("Bordeaux,
 France", "Napa Valley, California", …) into a **structured, vineyard-focused
 agronomic risk report** built from a real 14-day weather forecast.
 
+The project ships **two interchangeable backends** for the same workflow:
+
+- **CrewAI** (`src_crewai/`) — role-based multi-agent `Crew` with sequential `Process`.
+- **LangGraph** (`src_langgraph/`) — explicit `StateGraph` with typed shared state.
+
+Both share the same MCP tool server, prompts, and `RiskReport` schema. The
+backend is selected at runtime with a single CLI flag.
+
 The tool the agents rely on (combined geocoding + weather lookup) is
 **served over the
 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)** by a local
@@ -22,18 +30,18 @@ agentic system. Concretely, it covers:
 
 | Pattern | Where it lives | Why it matters |
 |---------|----------------|----------------|
-| **Role-based multi-agent decomposition** | `Forecaster`, `Agronomist`, `Reviewer` agents in [src/agent.py](src/agent.py) | Each agent has a narrow `role` + `goal` + `backstory`, which reduces hallucination and keeps reasoning focused. |
-| **Sequential pipeline / chain-of-agents** | `Process.sequential` Crew with explicit `context=[…]` between tasks | The output of one agent is a typed, deterministic input to the next — no implicit shared state. |
-| **ReAct (Reason + Act) tool use over MCP** | `Forecaster` agent → `get_forecast_for_location` MCP tool | The LLM reasons about the request, calls the tool, observes the result, and continues. The transport is standard MCP — not a CrewAI-only convention. |
-| **Structured output (schema-guided reasoning)** | `RiskReport` Pydantic model + `output_pydantic=RiskReport` on tasks in [src/agent.py](src/agent.py) | Forces the LLM into a machine-parseable JSON shape (severity, primary_risk, affected_dates, recommendation, summary). |
+| **Role-based multi-agent decomposition** | `Forecaster`, `Agronomist`, `Reviewer` agents in [src_crewai/agent.py](src_crewai/agent.py) and as graph nodes in [src_langgraph/agent.py](src_langgraph/agent.py) | Each agent has a narrow `role` + `goal` + `backstory`, which reduces hallucination and keeps reasoning focused. |
+| **Sequential pipeline / chain-of-agents** | CrewAI `Process.sequential` with explicit `context=[…]`; LangGraph linear edges over a `TypedDict` state | The output of one agent is a typed, deterministic input to the next — no implicit shared state. |
+| **ReAct (Reason + Act) tool use over MCP** | `Forecaster` step → `get_forecast_for_location` MCP tool | The agent calls the tool, observes the result, and continues. Transport is standard MCP — not a framework-specific convention. In the LangGraph version the Forecaster is a deterministic non-LLM node (cheaper, no "forgot to call the tool" failures). |
+| **Structured output (schema-guided reasoning)** | `RiskReport` Pydantic model — `output_pydantic=RiskReport` (CrewAI) / `llm.with_structured_output(RiskReport)` (LangGraph) | Forces the LLM into a machine-parseable JSON shape (severity, primary_risk, affected_dates, recommendation, summary). |
 | **Reflection / self-critique** | The `Reviewer` agent re-checks the Agronomist's `RiskReport` against the raw forecast | Catches mis-classified severity, fabricated dates, generic recommendations — the single biggest quality lever. |
-| **Rule-based / checklist prompting** | `AGRONOMIST_BACKSTORY` in [src/prompts.py](src/prompts.py) with quantified frost / heat / fungal / drought triggers | Turns vague "analyse the weather" into a deterministic rubric the LLM can apply. |
+| **Rule-based / checklist prompting** | `AGRONOMIST_BACKSTORY` in `prompts.py` (both backends) with quantified frost / heat / fungal / drought triggers | Turns vague "analyse the weather" into a deterministic rubric the LLM can apply. |
 | **Guardrailed prompting (anti-rambling)** | Strict "do not add filler", "act like a busy farmer" instructions | Saves tokens and protects the free-tier API quota. |
-| **Explicit context passing over implicit memory** | `memory=False` + `context=[task_forecast]` / `context=[task_forecast, task_analysis]` | For a linear pipeline this is cheaper, more deterministic, and avoids spurious embedding-store calls. |
-| **Tool isolation behind a protocol boundary** | FastMCP server launched as a subprocess via `StdioServerParameters` | Tools become reusable across clients (Claude Desktop, MCP Inspector, …) and can be replaced without touching agent code. |
+| **Explicit context passing over implicit memory** | CrewAI: `memory=False` + `context=[task_forecast, …]`. LangGraph: shared `AgriState` TypedDict | For a linear pipeline this is cheaper, more deterministic, and avoids spurious embedding-store calls. |
+| **Tool isolation behind a protocol boundary** | FastMCP server launched as a subprocess (stdio) | Tools become reusable across clients and can be replaced without touching agent code. |
 | **Deterministic tool composition** | Geocoding + forecast fetch are fused into one MCP tool (`get_forecast_for_location`) instead of two LLM-wrapper agents | Saves an LLM round-trip and removes a class of "the agent forgot to pass the coordinates" failures. |
-| **Resilient tool I/O** | `tenacity` retry with exponential backoff + shared `requests.Session` + timeouts in [src/mcp_server.py](src/mcp_server.py) | Transient network failures don't surface as agent errors. |
-| **Observability** | `verbose=True` on agents + Crew, plus `output_log_file=logs/session_*.txt` | Every prompt, tool call, and response is captured for post-mortem. |
+| **Resilient tool I/O** | `tenacity` retry with exponential backoff + shared `requests.Session` + timeouts in `mcp_server.py` | Transient network failures don't surface as agent errors. |
+| **Observability** | CrewAI: `verbose=True` + `output_log_file=logs/session_*.txt`. LangGraph: per-run `logs/session_langgraph_*.txt` trace. | Every prompt, tool call, and response is captured for post-mortem. |
 
 ### 0.2 Things I deliberately did NOT use (and why)
 
@@ -79,17 +87,25 @@ agentic system. Concretely, it covers:
 ```mermaid
 flowchart LR
     U["👤 User<br/>'Bordeaux, France'"] --> M[main.py]
-    M --> R[run_agri_crew]
+    M -->|--framework crewai| RC[run_agri_crew]
+    M -->|--framework langgraph| RL[run_agri_graph]
     subgraph CREW["CrewAI sequential pipeline"]
         direction LR
-        F["Forecaster Agent"] --> A["Agronomist Agent<br/>(→ RiskReport)"] --> RV["Reviewer Agent<br/>(reflection)"]
+        F1["Forecaster Agent"] --> A1["Agronomist Agent<br/>(→ RiskReport)"] --> RV1["Reviewer Agent<br/>(reflection)"]
     end
-    R --> CREW
-    F -- get_forecast_for_location --> SRV
+    subgraph LG["LangGraph StateGraph"]
+        direction LR
+        F2["forecaster node<br/>(deterministic)"] --> A2["agronomist node<br/>(→ RiskReport)"] --> RV2["reviewer node<br/>(reflection)"]
+    end
+    RC --> CREW
+    RL --> LG
+    F1 -- get_forecast_for_location --> SRV
+    F2 -- get_forecast_for_location --> SRV
     subgraph SRV["FastMCP server (stdio subprocess)"]
         T1["get_forecast_for_location<br/>→ Nominatim + Open-Meteo"]
     end
-    RV --> OUT["📋 Validated RiskReport<br/>+ logs/session_*.txt"]
+    RV1 --> OUT["📋 Validated RiskReport<br/>+ logs/session_*.txt"]
+    RV2 --> OUT
 ```
 
 ---
@@ -98,17 +114,24 @@ flowchart LR
 
 ```text
 weather_proj/
-├── main.py                 ← CLI entry point (REPL loop + result renderer)
+├── main.py                      ← CLI entry point; --framework {crewai,langgraph}
 ├── README.md
-├── src/
-│   ├── agent.py            ← CrewAI agents, tasks, crew, MCP client wiring
-│   ├── mcp_server.py       ← FastMCP server exposing the combined tool (stdio)
-│   ├── prompts.py          ← Backstories, task descriptions, RiskReport schema
-│   ├── tools.py            ← Legacy in-process tools (kept for reference)
-│   ├── config.yaml         ← LLM + embedder configuration
-│   └── requirements.txt    ← Python dependencies
-├── logs/                   ← Per-run timestamped trace files
-└── test_files/             ← Manual integration probes against the raw APIs
+├── src_crewai/                  ← CrewAI implementation
+│   ├── agent.py                 ← CrewAI agents, tasks, crew, MCP client wiring
+│   ├── mcp_server.py            ← FastMCP server exposing the combined tool (stdio)
+│   ├── prompts.py               ← Backstories, task descriptions, RiskReport schema
+│   ├── tools.py                 ← Legacy in-process tools (kept for reference)
+│   ├── config.yaml              ← LLM + embedder configuration
+│   └── requirements.txt         ← CrewAI dependencies
+├── src_langgraph/               ← LangGraph implementation (self-contained)
+│   ├── agent.py                 ← StateGraph build + persistent event loop
+│   ├── mcp_server.py            ← Same FastMCP server (duplicated for independence)
+│   ├── prompts.py               ← Same prompts + RiskReport schema
+│   ├── state.py                 ← AgriState TypedDict shared across nodes
+│   ├── config.yaml              ← LLM configuration
+│   └── requirements.txt         ← LangGraph dependencies
+├── logs/                        ← Per-run timestamped trace files (both backends)
+└── test_files/                  ← Manual integration probes against the raw APIs
     ├── test_geocoding.py
     └── test_weather.py
 ```
@@ -121,26 +144,35 @@ weather_proj/
 
 | Layer | Technology | Notes |
 |-------|------------|-------|
-| Multi-agent orchestration | **CrewAI** (`Crew`, `Agent`, `Task`, `Process.sequential`) | Sequential pipeline with explicit per-task `context=[…]`; no global memory. |
-| LLM | **Google Gemini 2.5 Flash** via `crewai.LLM` | Configured in [src/config.yaml](src/config.yaml); temperature `0.1` for analytical, deterministic output. |
-| Structured output | **Pydantic** (`RiskReport`) via `output_pydantic=` on tasks | Schema-guided reasoning + parse-free downstream rendering. |
+| Multi-agent orchestration (option A) | **CrewAI** (`Crew`, `Agent`, `Task`, `Process.sequential`) | Sequential pipeline with explicit per-task `context=[…]`; no global memory. |
+| Multi-agent orchestration (option B) | **LangGraph** (`StateGraph`, typed `AgriState`) | Three linear nodes (forecaster → agronomist → reviewer) sharing a `TypedDict` state. Forecaster is a deterministic non-LLM node. |
+| LLM | **Google Gemini 2.5 Flash** | CrewAI: `crewai.LLM`. LangGraph: `langchain_google_genai.ChatGoogleGenerativeAI`. Temperature `0.1` for analytical, deterministic output. |
+| Structured output | **Pydantic** (`RiskReport`) | CrewAI: `output_pydantic=RiskReport` on tasks. LangGraph: `llm.with_structured_output(RiskReport)`. |
 | Tool transport | **MCP** (Model Context Protocol) over **stdio** | Server is launched as a subprocess by the agent at runtime. |
 | Tool server | **FastMCP** (`fastmcp.FastMCP`) | Decorator-based registration; JSON Schema generated from Python type hints + docstrings. |
-| Tool client | `crewai_tools.MCPServerAdapter` + `mcp.StdioServerParameters` | First-party CrewAI ↔ MCP bridge. |
+| Tool client | CrewAI: `crewai_tools.MCPServerAdapter`. LangGraph: `langchain_mcp_adapters.MultiServerMCPClient` | First-party framework ↔ MCP bridges. |
 | Resilience | **tenacity** (exponential backoff, 3 attempts) + shared `requests.Session` + 15s timeout | Wraps every outbound HTTP call inside the MCP server. |
 | External APIs | **Nominatim** (OpenStreetMap) + **Open-Meteo** | Both free, no API key required. |
 | Config / secrets | `pyyaml` for `config.yaml`, `python-dotenv` for `.env` | `GEMINI_API_KEY` is the only required secret. |
 
-### 3.2 The three agents
+### 3.2 The three roles
 
-Defined in [src/agent.py](src/agent.py); backstories and the `RiskReport`
-schema live in [src/prompts.py](src/prompts.py).
+In the **CrewAI** build (see [src_crewai/agent.py](src_crewai/agent.py)) these
+are `Agent` instances; in the **LangGraph** build (see
+[src_langgraph/agent.py](src_langgraph/agent.py)) they are graph nodes. Both
+share backstories and the `RiskReport` schema in their respective `prompts.py`.
 
 | # | Role | Tool | Purpose | Output contract |
 |---|------|------|---------|-----------------|
-| 1 | **Agri-Weather Forecaster** (`forecaster`) | `get_forecast_for_location` (MCP) | Resolve free-text location → 14-day forecast in a single call | Raw multi-line forecast string from the tool, unmodified |
-| 2 | **Senior Agronomist** (`agronomist`) | *none — analysis only* | Detect the single most severe vineyard risk and emit a structured report | `RiskReport` (Pydantic: `severity`, `primary_risk`, `affected_dates`, `recommendation`, `summary`) |
-| 3 | **Chief Agronomy Reviewer** (`reviewer`) | *none — audit only* | Cross-check the Agronomist's `RiskReport` against the raw forecast; correct it if needed | `RiskReport` (validated or corrected) |
+| 1 | **Agri-Weather Forecaster** | `get_forecast_for_location` (MCP) | Resolve free-text location → 14-day forecast in a single call | Raw multi-line forecast string from the tool, unmodified |
+| 2 | **Senior Agronomist** | *none — analysis only* | Detect the single most severe vineyard risk and emit a structured report | `RiskReport` (Pydantic: `severity`, `primary_risk`, `affected_dates`, `recommendation`, `summary`) |
+| 3 | **Chief Agronomy Reviewer** | *none — audit only* | Cross-check the Agronomist's `RiskReport` against the raw forecast; correct it if needed | `RiskReport` (validated or corrected) |
+
+> In the LangGraph build the **Forecaster is implemented as a deterministic
+> Python node** (it just `await`s the MCP tool and stores the result in state)
+> rather than an LLM-driven ReAct agent. The original CrewAI version used a
+> thin LLM wrapper here; replacing it with a plain function is cheaper and
+> removes a class of "agent didn't call the tool" failures.
 
 The Agronomist applies a **quantified** rubric (not just "look for risks"):
 
@@ -151,9 +183,9 @@ The Agronomist applies a **quantified** rubric (not just "look for risks"):
 | **Fungal** | ≥ 2 consecutive days with Rain `> 5 mm` AND Max Temp `> 18 °C` |
 | **Drought** | ≥ 5 consecutive days with EvapoT `> 3 mm` AND Rain `== 0 mm` |
 
-### 3.3 The Crew
+### 3.3 Orchestration
 
-Configured in `run_agri_crew()` inside [src/agent.py](src/agent.py):
+**CrewAI** (`run_agri_crew()` in [src_crewai/agent.py](src_crewai/agent.py)):
 
 - `process=Process.sequential` — agents run one after the other in declared order.
 - `memory=False` — CrewAI's embedding-based memory is **off**. Context flows
@@ -164,7 +196,20 @@ Configured in `run_agri_crew()` inside [src/agent.py](src/agent.py):
 - `output_log_file=logs/session_<timestamp>.txt` — full reasoning trace per run.
 - `verbose=True` on both crew and agents — traces also stream to stdout.
 
-### 3.4 MCP server ([src/mcp_server.py](src/mcp_server.py))
+**LangGraph** (`_build_graph()` / `run_agri_graph()` in
+[src_langgraph/agent.py](src_langgraph/agent.py)):
+
+- `StateGraph(AgriState)` with three nodes wired `START → forecaster → agronomist → reviewer → END`.
+- Shared `AgriState` TypedDict ([src_langgraph/state.py](src_langgraph/state.py)) carries
+  `location_input`, `forecast`, `analysis`, `final_report` between nodes.
+- LLM nodes use `llm.with_structured_output(RiskReport)` so each
+  `await llm.ainvoke(…)` returns a typed `RiskReport` directly.
+- The compiled graph and a single `asyncio` event loop are **cached at module
+  level** across REPL iterations. This avoids the Windows `ProactorEventLoop`
+  + SSL teardown bug that occurs if you `asyncio.run()` on every request.
+- A per-run trace is written to `logs/session_langgraph_<timestamp>.txt`.
+
+### 3.4 MCP server (`mcp_server.py` — same in both backends)
 
 ```python
 from fastmcp import FastMCP
@@ -201,32 +246,47 @@ instead of raising.
 
 ### 3.5 Agent ↔ MCP wiring
 
-[src/agent.py](src/agent.py):
+**CrewAI** ([src_crewai/agent.py](src_crewai/agent.py)):
 
 ```python
 server_params = StdioServerParameters(
     command=sys.executable,
-    args=[MCP_SERVER_SCRIPT],     # absolute path to src/mcp_server.py
+    args=[MCP_SERVER_SCRIPT],     # absolute path to src_crewai/mcp_server.py
     env={**os.environ},           # propagate API keys to the subprocess
 )
 
 with MCPServerAdapter(server_params) as mcp_tools:
     forecast_tool = _pick_tool(mcp_tools, "get_forecast_for_location")
-    # ... build forecaster / agronomist / reviewer agents ...
-    # ... build tasks (with output_pydantic + explicit context) and Crew ...
+    # … build forecaster / agronomist / reviewer agents …
+    # … build tasks (with output_pydantic + explicit context) and Crew …
     return crew.kickoff(inputs={"location_input": location_input})
+```
+
+**LangGraph** ([src_langgraph/agent.py](src_langgraph/agent.py)):
+
+```python
+client = MultiServerMCPClient({
+    "weather": {
+        "command": sys.executable,
+        "args": [MCP_SERVER_SCRIPT],
+        "transport": "stdio",
+        "env": {**os.environ},
+    }
+})
+tools = await client.get_tools()
+forecast_tool = next(t for t in tools if t.name == "get_forecast_for_location")
+# … forecaster node calls forecast_tool.ainvoke({"location_name": …}) …
 ```
 
 Key points:
 
-- The `MCPServerAdapter` context manager **must wrap `crew.kickoff`** —
-  exiting the `with` block tears the subprocess down, so construction *and*
-  execution happen inside it.
-- `_pick_tool` looks tools up by name and falls back to attribute matching for
-  forward compatibility across `crewai-tools` versions.
+- In CrewAI the `MCPServerAdapter` context manager **must wrap `crew.kickoff`** —
+  exiting the `with` block tears the subprocess down.
 - Environment variables (notably `GEMINI_API_KEY` / `GOOGLE_API_KEY`) are
   propagated explicitly so the subprocess can make HTTPS calls in restricted
   environments.
+- In LangGraph the MCP client + compiled graph are built **once** and reused
+  across REPL iterations — see the persistent event loop note in §3.3.
 
 ### 3.6 End-to-end request flow
 
@@ -257,9 +317,13 @@ sequenceDiagram
     Note over Crew: Reviewer agent audits the RiskReport<br/>against the raw forecast → RiskReport
 
     Crew-->>Agent: final (validated) RiskReport
-    Agent-->>Main: result (CrewOutput with .pydantic)
+    Agent-->>Main: result (CrewOutput with .pydantic, or RiskReport in LangGraph)
     Main-->>U: 📋 pretty-printed report + logs/session_*.txt
 ```
+
+> The same sequence applies to the LangGraph backend; the only difference is
+> that `Crew` is replaced by a compiled `StateGraph` and the Forecaster is a
+> deterministic node rather than an LLM-driven agent.
 
 ---
 
@@ -271,10 +335,18 @@ sequenceDiagram
 
 ### 4.2 Install
 
+Install the dependencies for whichever backend(s) you want to use. They can
+coexist in the same venv.
+
 ```powershell
 python -m venv venv
 .\venv\Scripts\Activate.ps1
-pip install -r src/requirements.txt
+
+# CrewAI backend
+pip install -r src_crewai/requirements.txt
+
+# LangGraph backend
+pip install -r src_langgraph/requirements.txt
 ```
 
 ### 4.3 Configure secrets
@@ -285,12 +357,13 @@ Create a `.env` file at the project root:
 GEMINI_API_KEY=your-google-gemini-api-key
 ```
 
-[src/agent.py](src/agent.py) mirrors this into both `GEMINI_API_KEY` and
-`GOOGLE_API_KEY` (different Gemini SDKs read different names).
+Both backends mirror this into `GEMINI_API_KEY` and `GOOGLE_API_KEY`
+(different Gemini SDKs read different names).
 
 ### 4.4 (Optional) Tune the model
 
-Edit [src/config.yaml](src/config.yaml):
+Edit [src_crewai/config.yaml](src_crewai/config.yaml) and/or
+[src_langgraph/config.yaml](src_langgraph/config.yaml):
 
 ```yaml
 llm:
@@ -312,8 +385,15 @@ embedder:
 
 ### 5.1 Full agent pipeline
 
+Select the backend with `--framework`. Defaults to `crewai`.
+
 ```powershell
+# CrewAI (default)
 python main.py
+python main.py --framework crewai
+
+# LangGraph
+python main.py --framework langgraph
 ```
 
 Then enter a region at the prompt. Type `exit` or `quit` to leave.
@@ -321,16 +401,19 @@ Then enter a region at the prompt. Type `exit` or `quit` to leave.
 ### 5.2 MCP server standalone
 
 You can run the FastMCP server on its own to debug or to wire it into another
-MCP client (Claude Desktop, Cursor, etc.):
+MCP client (Claude Desktop, Cursor, etc.). Either copy works — they are
+identical:
 
 ```powershell
-python src/mcp_server.py
+python src_crewai/mcp_server.py
+# or
+python src_langgraph/mcp_server.py
 ```
 
 Inspect the tool surface interactively:
 
 ```powershell
-npx @modelcontextprotocol/inspector python src/mcp_server.py
+npx @modelcontextprotocol/inspector python src_crewai/mcp_server.py
 ```
 
 ### 5.3 Raw API smoke tests
@@ -348,16 +431,21 @@ python test_files/test_weather.py
 
 ## 6. Logging
 
-Every `run_agri_crew` invocation writes a timestamped trace file:
+Every run writes a timestamped trace file:
 
 ```text
-logs/session_YYYYMMDD_HHMMSS.txt
+logs/session_YYYYMMDD_HHMMSS.txt              (CrewAI)
+logs/session_langgraph_YYYYMMDD_HHMMSS.txt    (LangGraph)
 ```
 
-Combined with `verbose=True` on the agents and crew, this gives you:
+Combined with `verbose=True` on the CrewAI agents/crew, this gives you:
 - the exact prompt sent to Gemini for each task,
 - every tool call (name + arguments) and its response,
 - the final answer of each agent (including the structured `RiskReport`).
+
+The LangGraph trace is a compact dump of the forecast, draft analysis, and
+final report. For deeper tracing on that backend, enable LangSmith by
+setting `LANGSMITH_API_KEY` and `LANGSMITH_TRACING=true` in your `.env`.
 
 `main.py` also prints a pretty-rendered summary of the final `RiskReport`
 (`severity`, `primary_risk`, `affected_dates`, `recommendation`, `summary`)
@@ -371,19 +459,23 @@ something unparseable.
 Because tools live behind an MCP boundary, adding a new capability is a
 **single-file change** plus a one-line agent wiring:
 
-1. Add a new `@mcp.tool()` function in [src/mcp_server.py](src/mcp_server.py)
-   (route it through `_http_get` to inherit retries + timeout).
-2. In [src/agent.py](src/agent.py), pick it up via
+1. Add a new `@mcp.tool()` function in `mcp_server.py` (route it through
+   `_http_get` to inherit retries + timeout). Add to **both** backend folders
+   if you want the tool available in both, or symlink one to the other.
+2. **CrewAI:** in [src_crewai/agent.py](src_crewai/agent.py), pick it up via
    `_pick_tool(mcp_tools, "your_new_tool")` and pass it into the relevant
    agent's `tools=[…]` list.
+   **LangGraph:** in [src_langgraph/agent.py](src_langgraph/agent.py), pick it
+   up via `next(t for t in tools if t.name == "your_new_tool")` and call it
+   from the relevant node.
 
 Adding a new structured output field is similarly local:
 
-1. Add the field to `RiskReport` in [src/prompts.py](src/prompts.py).
+1. Add the field to `RiskReport` in `prompts.py` (in both backends).
 2. Mention it in `get_analysis_task_desc()` so the LLM populates it.
 
-No changes are needed in [main.py](main.py) or [src/config.yaml](src/config.yaml)
-unless you are introducing a new agent or task, or changing the LLM.
+No changes are needed in [main.py](main.py) unless you are introducing a new
+agent / node or changing the LLM.
 
 ---
 
@@ -393,8 +485,9 @@ unless you are introducing a new agent or task, or changing the LLM.
 |---------|--------------|-----|
 | `GEMINI_API_KEY not found in .env file.` | Missing or misnamed env file | Create `.env` at repo root with the key |
 | `Tool 'get_forecast_for_location' not found on MCP server` | `crewai-tools` version mismatch | `pip install -U "crewai-tools[mcp]"` |
-| Tool call hangs at startup | Subprocess can't import `fastmcp` / `tenacity` | Activate the venv before `python main.py`, or hardcode the venv's `python.exe` in `StdioServerParameters.command` |
-| `requests.exceptions.SSLError` | Corporate TLS interception | `pip-system-certs` is already pinned in `requirements.txt`; reinstall it inside the venv |
+| Tool call hangs at startup | Subprocess can't import `fastmcp` / `tenacity` | Activate the venv before `python main.py`, or hardcode the venv's `python.exe` in the stdio command |
+| `requests.exceptions.SSLError` | Corporate TLS interception | `pip-system-certs` is pinned in both `requirements.txt`; reinstall it inside the venv |
+| `RuntimeError: Event loop is closed` / SSL fatal errors on exit (LangGraph) | Per-call `asyncio.run()` churn on Windows | Already fixed: the LangGraph backend uses a persistent loop + `shutdown()` hook in `main.py` |
 | Final report is a raw JSON string instead of pretty-printed fields | LLM emitted invalid JSON for `RiskReport` | Re-run; if persistent, lower temperature in `config.yaml` or tighten `get_analysis_task_desc()` |
 | Empty / nonsense forecast | Bad geocoding hit | Try a more specific location (city + country) |
 
@@ -404,11 +497,14 @@ unless you are introducing a new agent or task, or changing the LLM.
 
 - **Python 3.10+**
 - **CrewAI** — multi-agent orchestration (`Process.sequential`, `output_pydantic`, explicit `context=[…]`)
+- **LangGraph** — alternative orchestration as a typed `StateGraph` (linear forecaster → agronomist → reviewer)
+- **LangChain** + **langchain-google-genai** — Gemini client for the LangGraph backend (`with_structured_output`)
+- **langchain-mcp-adapters** — MCP client bridge for LangChain/LangGraph
 - **Google Gemini 2.5 Flash** — reasoning LLM
 - **Pydantic** — structured `RiskReport` schema
 - **FastMCP** — Pythonic MCP server framework
 - **MCP** (`mcp` package) — protocol primitives (`StdioServerParameters`)
-- **crewai-tools** — `MCPServerAdapter` for the client side
+- **crewai-tools** — `MCPServerAdapter` for the CrewAI client side
 - **tenacity** — retry / backoff for outbound HTTP
 - **Nominatim / OpenStreetMap** — free geocoding
 - **Open-Meteo** — free agricultural weather API

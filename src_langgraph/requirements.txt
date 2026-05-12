@@ -1,0 +1,12 @@
+pip-system-certs
+requests
+langgraph
+langchain
+langchain-google-genai
+langchain-mcp-adapters
+fastmcp
+mcp
+pyyaml
+python-dotenv
+tenacity
+pydantic

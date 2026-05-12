@@ -23,8 +23,8 @@ from crewai_tools import MCPServerAdapter
 from dotenv import load_dotenv
 from mcp import StdioServerParameters
 
-from src import prompts
-from src.prompts import RiskReport
+from src_crewai import prompts
+from src_crewai.prompts import RiskReport
 
 # ---------------------------------------------------------------------------
 # Paths (resolved relative to this file - works from any cwd).
