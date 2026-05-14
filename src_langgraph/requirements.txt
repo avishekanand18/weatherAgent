@@ -1,9 +1,11 @@
 pip-system-certs
+truststore
 requests
 langgraph
 langchain
 langchain-google-genai
 langchain-mcp-adapters
+langsmith
 fastmcp
 mcp
 pyyaml

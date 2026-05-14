@@ -354,10 +354,17 @@ pip install -r src_langgraph/requirements.txt
 Create a `.env` file at the project root:
 
 ```dotenv
+# Required
 GEMINI_API_KEY=your-google-gemini-api-key
+
+# Optional - LangSmith tracing for the LangGraph backend (see §6.2)
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=lsv2_pt_your_key
+LANGSMITH_PROJECT=agri-weather-langgraph
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com
 ```
 
-Both backends mirror this into `GEMINI_API_KEY` and `GOOGLE_API_KEY`
+Both backends mirror `GEMINI_API_KEY` into `GEMINI_API_KEY` and `GOOGLE_API_KEY`
 (different Gemini SDKs read different names).
 
 ### 4.4 (Optional) Tune the model
@@ -429,7 +436,9 @@ python test_files/test_weather.py
 
 ---
 
-## 6. Logging
+## 6. Logging & observability
+
+### 6.1 Local file logs
 
 Every run writes a timestamped trace file:
 
@@ -443,14 +452,75 @@ Combined with `verbose=True` on the CrewAI agents/crew, this gives you:
 - every tool call (name + arguments) and its response,
 - the final answer of each agent (including the structured `RiskReport`).
 
-The LangGraph trace is a compact dump of the forecast, draft analysis, and
-final report. For deeper tracing on that backend, enable LangSmith by
-setting `LANGSMITH_API_KEY` and `LANGSMITH_TRACING=true` in your `.env`.
+The LangGraph trace is a compact dump of the forecast, draft analysis, final
+report, and a `reflection_changed_report` boolean indicating whether the
+Reviewer modified the Agronomist's draft.
 
 `main.py` also prints a pretty-rendered summary of the final `RiskReport`
 (`severity`, `primary_risk`, `affected_dates`, `recommendation`, `summary`)
 when the run completes, and falls back to raw output if the LLM produced
 something unparseable.
+
+### 6.2 LangSmith tracing (LangGraph backend)
+
+The LangGraph backend is instrumented for [LangSmith](https://smith.langchain.com).
+When `LANGSMITH_TRACING=true` is set (see §4.3), every query produces a
+structured trace tree you can search, filter, and chart.
+
+#### What you see in the LangSmith UI
+
+| Surface | What it shows |
+|---------|---------------|
+| **Threads view** | All queries from one REPL session grouped under a single `thread_id` (one UUID minted per process). |
+| **Root run** | Named `agri-weather: <location>`, tagged with the final `risk:<x>` and `severity:<y>`, plus outcome metadata (see below). |
+| **Child spans** | Self-documenting names: `MCP · forecast(<location>)`, `Agronomist · analyse forecast`, `Reviewer · audit draft`. Each LLM span carries token counts, latency, raw prompt, parsed `RiskReport`. |
+| **Feedback** | Per-run `reflection_triggered` score (1 if the Reviewer changed the draft, 0 otherwise) — chartable as a "reflection rate" over time. |
+| **Run metadata** | `framework`, `model`, `temperature`, `session_id`, `location_input`, `primary_risk`, `severity`, `affected_days`, `reflection_changed_report`. |
+
+#### How it's wired (code-side changes in [src_langgraph/agent.py](src_langgraph/agent.py))
+
+1. **Thread grouping.** Module-level `_SESSION_ID = uuid.uuid4()` is passed
+   as `configurable.thread_id` on every `graph.ainvoke(...)`, so all queries
+   issued in one REPL session collapse into one Thread in LangSmith.
+2. **Named spans.** Each `forecast_tool.ainvoke` / `llm.ainvoke` call passes
+   a `RunnableConfig` with `run_name` and `tags`. This turns generic
+   `ChatGoogleGenerativeAI` / tool spans into readable
+   `Agronomist · analyse forecast`, `Reviewer · audit draft`,
+   `MCP · forecast(<location>)` rows.
+3. **Base metadata.** A `_RUN_METADATA_BASE` dict (framework, model name,
+   temperature, session id) is merged into every run's metadata, so traces
+   are diffable across model/code changes.
+4. **Outcome enrichment.** `langchain_core.tracers.context.collect_runs()`
+   captures the root run id. After the graph completes, `_annotate_run`
+   calls `langsmith.Client.update_run(...)` to push `primary_risk`,
+   `severity`, `affected_days`, and `reflection_changed_report` onto the
+   root run, and adds `risk:<x>` / `severity:<y>` tags for one-click
+   filtering.
+5. **Feedback score.** The same helper calls `Client.create_feedback(...)`
+   with `key="reflection_triggered"`, score `1`/`0`, and a short comment.
+   LangSmith plots this automatically.
+6. **Fail-safe.** `_annotate_run` is gated on `LANGSMITH_TRACING=true` and
+   wrapped in `try/except` — if LangSmith is unreachable, the user still
+   gets their `RiskReport`. The `langsmith` import is local to the helper
+   so the dependency is optional at runtime.
+7. **Corporate TLS.** `truststore.inject_into_ssl()` runs before any other
+   import in `agent.py` to make the LangSmith `httpx` client (and Gemini's)
+   trust the OS root store instead of `certifi`. Required behind MITM
+   proxies; otherwise the trace upload fails with `CERTIFICATE_VERIFY_FAILED`.
+
+#### Useful LangSmith UI queries
+
+- All critical-frost runs: filter `Tag: severity:critical AND Tag: risk:frost`.
+- Runs where reflection actually fixed something: filter
+  `Feedback: reflection_triggered = 1`.
+- Compare two models: switch `model_name` in `config.yaml`, run the same
+  prompts, then group by the `model` metadata field in LangSmith.
+
+#### Turning it off
+
+Set `LANGSMITH_TRACING=false` (or remove it) in `.env`. No code change
+needed. The CrewAI backend is unaffected either way — it uses its own
+`output_log_file` log instead.
 
 ---
 
@@ -488,6 +558,7 @@ agent / node or changing the LLM.
 | Tool call hangs at startup | Subprocess can't import `fastmcp` / `tenacity` | Activate the venv before `python main.py`, or hardcode the venv's `python.exe` in the stdio command |
 | `requests.exceptions.SSLError` | Corporate TLS interception | `pip-system-certs` is pinned in both `requirements.txt`; reinstall it inside the venv |
 | `RuntimeError: Event loop is closed` / SSL fatal errors on exit (LangGraph) | Per-call `asyncio.run()` churn on Windows | Already fixed: the LangGraph backend uses a persistent loop + `shutdown()` hook in `main.py` |
+| `LangSmithConnectionError: CERTIFICATE_VERIFY_FAILED` when tracing | Corporate TLS interception (LangSmith uses `httpx`, not `requests`) | `truststore.inject_into_ssl()` runs at the top of [src_langgraph/agent.py](src_langgraph/agent.py); ensure `truststore` is installed |
 | Final report is a raw JSON string instead of pretty-printed fields | LLM emitted invalid JSON for `RiskReport` | Re-run; if persistent, lower temperature in `config.yaml` or tighten `get_analysis_task_desc()` |
 | Empty / nonsense forecast | Bad geocoding hit | Try a more specific location (city + country) |
 
@@ -500,12 +571,14 @@ agent / node or changing the LLM.
 - **LangGraph** — alternative orchestration as a typed `StateGraph` (linear forecaster → agronomist → reviewer)
 - **LangChain** + **langchain-google-genai** — Gemini client for the LangGraph backend (`with_structured_output`)
 - **langchain-mcp-adapters** — MCP client bridge for LangChain/LangGraph
+- **LangSmith** — trace tree, threads, outcome metadata, and `reflection_triggered` feedback for the LangGraph backend
 - **Google Gemini 2.5 Flash** — reasoning LLM
 - **Pydantic** — structured `RiskReport` schema
 - **FastMCP** — Pythonic MCP server framework
 - **MCP** (`mcp` package) — protocol primitives (`StdioServerParameters`)
 - **crewai-tools** — `MCPServerAdapter` for the CrewAI client side
 - **tenacity** — retry / backoff for outbound HTTP
+- **truststore** — routes Python TLS through the OS trust store (fixes corporate MITM for `httpx`-based clients like LangSmith)
 - **Nominatim / OpenStreetMap** — free geocoding
 - **Open-Meteo** — free agricultural weather API
 - **PyYAML**, **python-dotenv**, **pip-system-certs**, **requests**

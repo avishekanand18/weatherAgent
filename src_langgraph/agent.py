@@ -9,14 +9,26 @@ Graph: START -> forecaster -> agronomist -> reviewer -> END
 """
 from __future__ import annotations
 
+# Make Python's ssl module use the OS (Windows) trust store. This is required
+# behind corporate TLS interception, where the LangSmith httpx client would
+# otherwise fail with "certificate verify failed: unable to get local issuer
+# certificate". Must run before any module imports `ssl` and builds a context.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
 import asyncio
 import os
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
+from langchain_core.tracers.context import collect_runs
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.graph import END, START, StateGraph
@@ -45,6 +57,22 @@ with open(CONFIG_PATH, "r") as f:
 
 LOGS_DIR.mkdir(exist_ok=True)
 
+# ---------------------------------------------------------------------------
+# LangSmith integration helpers.
+# ---------------------------------------------------------------------------
+# A single thread_id ties every query in this REPL session together in the
+# LangSmith "Threads" view, instead of producing N orphan runs.
+_SESSION_ID = str(uuid.uuid4())
+_LS_TRACING = os.getenv("LANGSMITH_TRACING", "").lower() == "true"
+
+# Lightweight context tags pushed onto every run.
+_RUN_METADATA_BASE = {
+    "framework": "langgraph",
+    "model": config["llm"]["model_name"],
+    "temperature": config["llm"]["temperature"],
+    "session_id": _SESSION_ID,
+}
+
 _llm = ChatGoogleGenerativeAI(
     model=config["llm"]["model_name"],
     temperature=config["llm"]["temperature"],
@@ -71,7 +99,14 @@ async def _build_graph():
     reviewer_llm = _llm.with_structured_output(RiskReport)
 
     async def forecaster_node(state: AgriState) -> dict:
-        result = await forecast_tool.ainvoke({"location_name": state["location_input"]})
+        loc = state["location_input"]
+        result = await forecast_tool.ainvoke(
+            {"location_name": loc},
+            config={
+                "run_name": f"MCP · forecast({loc})",
+                "tags": ["mcp", "tool"],
+            },
+        )
         return {"forecast": str(result)}
 
     async def agronomist_node(state: AgriState) -> dict:
@@ -84,7 +119,13 @@ async def _build_graph():
                 + f"\n\n14-DAY FORECAST:\n{forecast}",
             ),
         ]
-        report = await agronomist_llm.ainvoke(msgs)
+        report = await agronomist_llm.ainvoke(
+            msgs,
+            config={
+                "run_name": "Agronomist · analyse forecast",
+                "tags": ["llm", "analysis"],
+            },
+        )
         return {"analysis": report}
 
     async def reviewer_node(state: AgriState) -> dict:
@@ -99,7 +140,13 @@ async def _build_graph():
                 + f"\n\nDRAFT REPORT:\n{draft.model_dump_json(indent=2)}",
             ),
         ]
-        report = await reviewer_llm.ainvoke(msgs)
+        report = await reviewer_llm.ainvoke(
+            msgs,
+            config={
+                "run_name": "Reviewer · audit draft",
+                "tags": ["llm", "reflection"],
+            },
+        )
         return {"final_report": report}
 
     g = StateGraph(AgriState)
@@ -118,18 +165,82 @@ async def _run_async(graph, location_input: str) -> RiskReport:
     log_file_path = LOGS_DIR / f"session_langgraph_{timestamp}.txt"
 
     initial: AgriState = {"location_input": location_input}
-    final_state = await graph.ainvoke(initial)
+    # Run name + tags + metadata + thread_id surface in the LangSmith UI when
+    # LANGSMITH_TRACING=true. thread_id groups every query in this REPL
+    # session under one "Thread" instead of producing orphan runs.
+    run_config: dict = {
+        "run_name": f"agri-weather: {location_input}",
+        "tags": ["agri-weather", "langgraph"],
+        "metadata": {**_RUN_METADATA_BASE, "location_input": location_input},
+        "configurable": {"thread_id": _SESSION_ID},
+    }
+
+    # `collect_runs` captures the root run id so we can enrich it with outcome
+    # metadata + feedback once the workflow has produced its final answer.
+    with collect_runs() as cb:
+        final_state = await graph.ainvoke(initial, config=run_config)
 
     report: RiskReport = final_state["final_report"]
+    draft: RiskReport = final_state["analysis"]
+    reflection_changed = report.model_dump() != draft.model_dump()
+
     log_file_path.write_text(
         "=== LangGraph session ===\n"
         f"Location: {location_input}\n\n"
         f"--- Forecast ---\n{final_state.get('forecast', '')}\n"
-        f"--- Draft Analysis ---\n{final_state['analysis'].model_dump_json(indent=2)}\n"
-        f"--- Final Report ---\n{report.model_dump_json(indent=2)}\n",
+        f"--- Draft Analysis ---\n{draft.model_dump_json(indent=2)}\n"
+        f"--- Final Report ---\n{report.model_dump_json(indent=2)}\n"
+        f"--- Reflection changed report: {reflection_changed} ---\n",
         encoding="utf-8",
     )
+
+    _annotate_run(cb, report, reflection_changed)
     return report
+
+
+def _annotate_run(cb, report: RiskReport, reflection_changed: bool) -> None:
+    """Push outcome metadata + a feedback score onto the root LangSmith run.
+
+    Lets you filter runs in the LangSmith UI by `severity:*` / `risk:*` and
+    chart the "reflection rate" (how often the Reviewer actually corrected
+    the Agronomist's draft).
+    """
+    if not _LS_TRACING or not cb.traced_runs:
+        return
+    try:
+        from langsmith import Client  # local import: optional dep
+        client = Client()
+        root_id = cb.traced_runs[0].id
+        client.update_run(
+            root_id,
+            extra={
+                "metadata": {
+                    "primary_risk": report.primary_risk,
+                    "severity": report.severity,
+                    "affected_days": len(report.affected_dates),
+                    "reflection_changed_report": reflection_changed,
+                }
+            },
+            tags=[
+                "agri-weather",
+                "langgraph",
+                f"risk:{report.primary_risk}",
+                f"severity:{report.severity}",
+            ],
+        )
+        client.create_feedback(
+            root_id,
+            key="reflection_triggered",
+            score=1 if reflection_changed else 0,
+            comment=(
+                "Reviewer modified the agronomist's draft."
+                if reflection_changed
+                else "Reviewer approved the draft as-is."
+            ),
+        )
+    except Exception as exc:
+        # Never let observability break the user-facing run.
+        print(f"[langsmith] failed to annotate root run: {exc}")
 
 
 # ---------------------------------------------------------------------------
